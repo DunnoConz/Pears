@@ -44,7 +44,7 @@ jobs:
       run: zig build test-all
 
     - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: pears-${{ matrix.os }}
         path: zig-out/bin/pears
