@@ -1,0 +1,157 @@
+name: Release Pears
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build and Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0
+
+      - name: Install Dependencies (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblua5.4-dev
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Create artifacts
+        run: |
+          mkdir -p release-artifacts/linux
+          cp zig-out/bin/pears release-artifacts/linux/
+          cd release-artifacts && tar czf pears-linux-x86_64.tar.gz linux
+          sha256sum pears-linux-x86_64.tar.gz > pears-linux-x86_64.tar.gz.sha256
+
+      - name: Set Release Tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          fi
+
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          echo "Generating release notes for ${{ env.RELEASE_TAG }}"
+          # Extract commits since last tag for release notes
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            # Use the previous tag as the starting point
+            PREV_TAG=$(git describe --tags --abbrev=0 --exclude=${{ github.event.inputs.version }} 2>/dev/null || echo "")
+          else
+            # For tag pushes, use the previous tag
+            PREV_TAG=$(git describe --tags --abbrev=0 --exclude=${GITHUB_REF#refs/tags/} 2>/dev/null || echo "")
+          fi
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "## Changes since $PREV_TAG" > release_notes.md
+            git log --pretty=format:"- %s" $PREV_TAG..HEAD >> release_notes.md
+          else
+            echo "## Initial Release" > release_notes.md
+            git log --pretty=format:"- %s" >> release_notes.md
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "Pears ${{ env.RELEASE_TAG }}"
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            release-artifacts/pears-linux-x86_64.tar.gz
+            release-artifacts/pears-linux-x86_64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build macOS Version
+    runs-on: macos-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.11.0
+
+      - name: Install Dependencies
+        run: |
+          brew install lua
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Create artifacts
+        run: |
+          mkdir -p release-artifacts/macos
+          cp zig-out/bin/pears release-artifacts/macos/
+          cd release-artifacts && tar czf pears-macos-x86_64.tar.gz macos
+          shasum -a 256 pears-macos-x86_64.tar.gz > pears-macos-x86_64.tar.gz.sha256
+
+      - name: Get Release
+        uses: actions/github-script@v6
+        id: get_release
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.GITHUB_REF.replace('refs/tags/', '') ||
+                        '${{ github.event.inputs.version }}';
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: tag
+            });
+            return release.data.id;
+          result-encoding: string
+
+      - name: Upload macOS Assets
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const releaseId = ${{ steps.get_release.outputs.result }};
+
+            // Upload the tarball
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              name: 'pears-macos-x86_64.tar.gz',
+              data: fs.readFileSync('./release-artifacts/pears-macos-x86_64.tar.gz')
+            });
+
+            // Upload the checksum
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              name: 'pears-macos-x86_64.tar.gz.sha256',
+              data: fs.readFileSync('./release-artifacts/pears-macos-x86_64.tar.gz.sha256')
+            });

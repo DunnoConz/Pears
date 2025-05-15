@@ -1,4 +1,4 @@
-name: Build and Deploy Docs
+name: Deploy Documentation
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
     paths:
       - 'docs/**'
       - '.github/workflows/docs.yml'
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
