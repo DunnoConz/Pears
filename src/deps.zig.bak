@@ -1,0 +1,731 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const process = std.process;
+
+const Package = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    options: ?[]const []const u8 = null,
+};
+
+const Environment = struct {
+    type: PackageManager,
+    packages: std.ArrayList(Package),
+};
+
+const Config = struct {
+    environments: std.StringHashMap(Environment),
+
+    fn deinit(self: *Config, allocator: Allocator) void {
+        var it = self.environments.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.packages.items) |pkg| {
+                if (pkg.options) |opts| {
+                    allocator.free(opts);
+                }
+                allocator.free(pkg.name);
+                if (pkg.version) |ver| {
+                    allocator.free(ver);
+                }
+            }
+            entry.value_ptr.packages.deinit();
+            allocator.free(entry.key_ptr.*);
+        }
+        self.environments.deinit();
+    }
+};
+
+pub const PackageManager = enum {
+    ///// Represents a package manager that can be used to install dependencies
+    // System package managers
+    brew,
+    apt,
+    dnf,
+    pacman,
+    // Language package managers
+    cargo,
+    npm,
+    yarn,
+    pip,
+    pip3,
+    go,
+    gem,
+    // Special cases
+    app_store,
+    custom,
+
+    /// Returns whether this package manager requires sudo for installation
+    pub fn needsSudo(self: PackageManager) bool {
+        return switch (self) {
+            .apt, .dnf, .pacman => true,
+            else => false,
+        };
+    }
+
+    /// Converts a string to a PackageManager enum value
+    pub fn fromString(str: []const u8) ?PackageManager {
+        const map = std.ComptimeStringMap(PackageManager, .{
+            .{ "brew", .brew },
+            .{ "apt", .apt },
+            .{ "dnf", .dnf },
+            .{ "pacman", .pacman },
+            .{ "cargo", .cargo },
+            .{ "npm", .npm },
+            .{ "yarn", .yarn },
+            .{ "pip", .pip },
+            .{ "pip3", .pip3 },
+            .{ "go", .go },
+            .{ "gem", .gem },
+            .{ "app_store", .app_store },
+            .{ "custom", .custom },
+        });
+        return map.get(str);
+    }
+};
+
+pub const DependencyInfo = struct {
+    name: []const u8,
+    version: ?[]const u8 = null,
+    manager: PackageManager,
+    url: ?[]const u8 = null,
+    options: ?[]const []const u8 = null,
+};
+
+pub const DependencyManager = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    env_name: ?[]const u8 = null,
+    verbose: bool = false,
+    dry_run: bool = false,
+    installing: std.StringHashMap(void),
+    installed_packages: std.StringHashMap(void),
+    installation_order: std.ArrayList(DependencyInfo),
+
+    pub fn init(allocator: std.mem.Allocator) !*Self {
+        // Create the manager instance
+        var self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
+        // Initialize the struct fields directly
+        self.* = .{
+            .allocator = allocator,
+            .env_name = null,
+            .verbose = false,
+            .dry_run = false,
+            .installing = std.StringHashMap(void).init(allocator),
+            .installed_packages = std.StringHashMap(void).init(allocator),
+            .installation_order = std.ArrayList(DependencyInfo).init(allocator),
+        };
+
+        return self;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.installed_packages.deinit();
+        self.installing.deinit();
+        self.installation_order.deinit();
+        self.allocator.destroy(self);
+    }
+
+    pub fn setVerbose(self: *Self, verbose: bool) void {
+        self.verbose = verbose;
+    }
+
+    pub fn setDryRun(self: *Self, dry_run: bool) void {
+        self.dry_run = dry_run;
+    }
+
+    /// Loads and processes the configuration file
+    pub fn loadEnvironment(self: *Self, path: []const u8) !void {
+        if (self.verbose) {
+            std.debug.print("Loading environment from {s}...\n", .{path});
+        }
+        
+        // For now, we'll use a hardcoded configuration since we don't have Lua parsing yet
+        // In a real implementation, this would parse the Lua file
+        
+        // Define environment types
+        const Env = struct {
+            type: PackageManager,
+            packages: []const struct {
+                name: []const u8,
+                options: ?[]const []const u8 = null,
+                script: ?[]const u8 = null,
+            },
+        };
+        
+        // Define custom script type
+        const CustomScript = struct {
+            name: []const u8,
+            type: []const u8,
+            script: []const u8,
+        };
+        
+        // Create environments map (simulating the Lua config)
+        var environments = std.StringHashMap(Env).init(self.allocator);
+        defer environments.deinit();
+        
+        // System packages (Homebrew)
+        try environments.put("system", .{
+            .type = .brew,
+            .packages = &[_]struct {
+                name: []const u8,
+                options: ?[]const []const u8 = null,
+            }{
+                .{ .name = "ripgrep" },
+                .{ .name = "fd" },
+                .{ .name = "fzf" },
+                .{ .name = "bat" },
+                .{ .name = "eza" },
+                .{ .name = "zoxide" },
+                .{ .name = "jq" },
+                .{ .name = "yq" },
+                .{ .name = "htop" },
+                .{ .name = "tldr" },
+                .{ .name = "neofetch" },
+                .{ .name = "node" },
+                .{ .name = "pnpm" },
+                .{ .name = "vercel-cli" },
+                .{ .name = "supabase/tap/supabase" },
+                .{ .name = "railway" },
+                .{ .name = "zig" },
+                .{ .name = "zls" },
+                .{ .name = "rustup" },
+                .{ .name = "gh" },
+                .{ .name = "lazygit" },
+                .{ .name = "kitty" },
+                .{ .name = "asdf" },
+            },
+        });
+        
+        // Node.js packages
+        try environments.put("node", .{
+            .type = .npm,
+            .packages = &[_]struct {
+                name: []const u8,
+                options: ?[]const []const u8 = null,
+            }{
+                .{ .name = "typescript" },
+                .{ .name = "prettier" },
+                .{ .name = "eslint" },
+                .{ .name = "@biomejs/biome" },
+            },
+        });
+        
+        // Python packages
+        try environments.put("python", .{
+            .type = .pip,
+            .packages = &[_]struct {
+                name: []const u8,
+                options: ?[]const []const u8 = null,
+            }{
+                .{ .name = "black" },
+                .{ .name = "isort" },
+                .{ .name = "pylint" },
+            },
+        });
+        
+        // Rust tools
+        try environments.put("rust", .{
+            .type = .cargo,
+            .packages = &[_]struct {
+                name: []const u8,
+                options: ?[]const []const u8 = null,
+            }{
+                .{ .name = "cargo-edit" },
+                .{ .name = "cargo-watch" },
+                .{ .name = "cargo-expand" },
+            },
+        });
+        
+        // Custom scripts
+        const custom_scripts = &[_]CustomScript{
+            .{
+                .name = "jetzig-cli",
+                .type = "script",
+                .script = 
+                \\if ! command -v jetzig &> /dev/null; then
+                \\  echo "Installing Jetzig CLI..."
+                \\  git clone https://github.com/jetzig-framework/jetzig.git /tmp/jetzig
+                \\  cd /tmp/jetzig
+                \\  zig build -Doptimize=ReleaseSafe
+                \\  mkdir -p ~/bin
+                \\  cp zig-out/bin/jetzig ~/bin/
+                \\  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+                \\  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+                \\  echo "Jetzig CLI installed to ~/bin/jetzig"
+                \\  echo "Please restart your shell or run 'source ~/.zshrc'"
+                \\else
+                \\  echo "Jetzig CLI is already installed"
+                \\fi
+                ,
+            },
+            .{
+                .name = "shell-config",
+                .type = "script",
+                .script = 
+                \\# Add zoxide to shell
+                \\if ! grep -q 'eval "$(zoxide init' ~/.zshrc 2>/dev/null; then
+                \\  echo 'eval "$(zoxide init zsh)"' >> ~/.zshrc
+                \\fi
+                \\
+                \\# Add eza aliases
+                \\if ! grep -q 'alias ls=' ~/.zshrc 2>/dev/null; then
+                \\  echo 'alias ls="eza --icons --group-directories-first"' >> ~/.zshrc
+                \\  echo 'alias ll="eza -l --icons --group-directories-first"' >> ~/.zshrc
+                \\  echo 'alias la="eza -la --icons --group-directories-first"' >> ~/.zshrc
+                \\fi
+                \\
+                \\# Add bat to shell
+                \\if ! grep -q 'alias cat=' ~/.zshrc 2>/dev/null; then
+                \\  echo 'alias cat="bat --theme=TwoDark"' >> ~/.zshrc
+                \\fi
+                ,
+            },
+        };
+        
+        if (self.verbose) {
+            std.debug.print("Configuration loaded successfully\n", .{});
+        }
+        
+        // Install packages for each environment
+        var env_it = environments.iterator();
+        while (env_it.next()) |entry| {
+            const env_name = entry.key_ptr.*;
+            const env = entry.value_ptr.*;
+            
+            if (self.verbose) {
+                std.debug.print("Installing packages for environment '{s}'...\n", .{env_name});
+            }
+            
+            for (env.packages) |pkg| {
+                std.debug.print("Installing {s} with {s}...\n", .{ pkg.name, @tagName(env.type) });
+                try self.installPackage(env.type, pkg.name, null, pkg.options);
+            }
+        }
+        
+        // Run custom scripts
+        if (self.verbose) {
+            std.debug.print("Running custom scripts...\n", .{});
+        }
+        
+        for (custom_scripts) |script| {
+            std.debug.print("Running custom script: {s}\n", .{script.name});
+            
+            // Create a temporary shell script
+            const temp_script_path = "/tmp/pears_script.sh";
+            const temp_script = try std.fs.cwd().createFile(temp_script_path, .{});
+            defer temp_script.close();
+            
+            // Write the shebang and script content
+            try temp_script.writeAll("#!/bin/bash\n");
+            try temp_script.writeAll(script.script);
+            
+            // Make the script executable
+            const script_args = [_][]const u8{ "chmod", "+x", temp_script_path };
+            try self.runCommand(&script_args);
+            
+            // Execute the script
+            const exec_args = [_][]const u8{ "/bin/bash", temp_script_path };
+            _ = self.runCommand(&exec_args) catch |err| {
+                std.debug.print("Error running script {s}: {s}\n", .{ script.name, @errorName(err) });
+            };
+        }
+    }
+
+    /// Installs a package using the specified package manager
+    fn installPackage(self: *Self, manager: PackageManager, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        // Skip if already installed
+        if (self.installing.contains(name) or self.installed_packages.contains(name)) {
+            if (self.verbose) {
+                std.debug.print("Skipping already installed package: {s}\n", .{name});
+            }
+            return;
+        }
+
+        // Mark as installing
+        try self.installing.put(name, {});
+        defer _ = self.installing.remove(name);
+
+        if (self.verbose) {
+            std.debug.print("Installing {s} with {s}...\n", .{ name, @tagName(manager) });
+        }
+
+        // Skip if in dry run mode
+        if (self.dry_run) {
+            std.debug.print("[DRY RUN] Would install {s} with {s}\n", .{ name, @tagName(manager) });
+            return;
+        }
+
+        // Install based on package manager
+        switch (manager) {
+            .brew => try self.installBrewPackage(name, version, options),
+            .cargo => try self.installCargoPackage(name, version, options),
+            .npm, .yarn => try self.installNpmPackage(manager, name, version, options),
+            .pip, .pip3 => try self.installPipPackage(manager, name, version, options),
+            // Add other package managers here
+            else => {
+                std.debug.print("Unsupported package manager: {s}\n", .{@tagName(manager)});
+                return error.UnsupportedPackageManager;
+            },
+        }
+
+        // Mark as installed
+        try self.installed_packages.put(name, {});
+        
+        // Add to installation order
+        try self.installation_order.append(.{
+            .name = try self.allocator.dupe(u8, name),
+            .version = if (version) |v| try self.allocator.dupe(u8, v) else null,
+            .manager = manager,
+        });
+    }
+            .{ .name = "eslint" },
+            .{ .name = "@biomejs/biome" },
+        },
+    });
+    
+    // Python packages
+    try environments.put("python", .{
+        .type = .pip,
+        .packages = &[_]struct {
+            name: []const u8,
+            options: ?[]const []const u8 = null,
+        }{
+            .{ .name = "black" },
+            .{ .name = "isort" },
+            .{ .name = "pylint" },
+        },
+    });
+    
+    // Rust tools
+    try environments.put("rust", .{
+        .type = .cargo,
+        .packages = &[_]struct {
+            name: []const u8,
+            options: ?[]const []const u8 = null,
+        }{
+            .{ .name = "cargo-edit" },
+            .{ .name = "cargo-watch" },
+            .{ .name = "cargo-expand" },
+        },
+    });
+    
+    // Custom scripts
+    const custom_scripts = &[_]CustomScript{
+        .{
+            .name = "jetzig-cli",
+            .type = "script",
+            .script = 
+            \\if ! command -v jetzig &> /dev/null; then
+            \\  echo "Installing Jetzig CLI..."
+            \\  git clone https://github.com/jetzig-framework/jetzig.git /tmp/jetzig
+            \\  cd /tmp/jetzig
+            \\  zig build -Doptimize=ReleaseSafe
+            \\  mkdir -p ~/bin
+            \\  cp zig-out/bin/jetzig ~/bin/
+            \\  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
+            \\  echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+            \\  echo "Jetzig CLI installed to ~/bin/jetzig"
+            \\  echo "Please restart your shell or run 'source ~/.zshrc'"
+            \\else
+            \\  echo "Jetzig CLI is already installed"
+            \\fi
+            ,
+        },
+        .{
+            .name = "shell-config",
+            .type = "script",
+            .script = 
+            \\# Add zoxide to shell
+            \\if ! grep -q 'eval "$(zoxide init' ~/.zshrc 2>/dev/null; then
+            \\  echo 'eval "$(zoxide init zsh)"' >> ~/.zshrc
+            \\fi
+            \\
+            \\# Add eza aliases
+            \\if ! grep -q 'alias ls=' ~/.zshrc 2>/dev/null; then
+            \\  echo 'alias ls="eza --icons --group-directories-first"' >> ~/.zshrc
+            \\  echo 'alias ll="eza -l --icons --group-directories-first"' >> ~/.zshrc
+            \\  echo 'alias la="eza -la --icons --group-directories-first"' >> ~/.zshrc
+            \\fi
+            \\
+            \\# Add bat to shell
+            \\if ! grep -q 'alias cat=' ~/.zshrc 2>/dev/null; then
+            \\  echo 'alias cat="bat --theme=TwoDark"' >> ~/.zshrc
+            \\fi
+            ,
+        },
+    };
+    
+    if (self.verbose) {
+        std.debug.print("Configuration loaded successfully\n", .{});
+    }
+    
+    // Install packages for each environment
+    var env_it = environments.iterator();
+    while (env_it.next()) |entry| {
+        const env_name = entry.key_ptr.*;
+        const env = entry.value_ptr.*;
+        
+        if (self.verbose) {
+            std.debug.print("Installing packages for environment '{s}'...\n", .{env_name});
+    ///   manager: The package manager to use
+    ///   name: Name of the package to install
+    ///   version: Optional version constraint
+    ///   options: Additional options to pass to the package manager
+    fn installSystemPackage(self: *Self, manager: PackageManager, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = .{ manager, version, options }; // Not yet used
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        // Add package manager command
+        switch (manager) {
+            .apt => {
+                try args.append("apt-get");
+                try args.append("install");
+                try args.append("-y");
+            },
+            .dnf => {
+                try args.append("dnf");
+                try args.append("install");
+                try args.append("-y");
+            },
+            .pacman => {
+                try args.append("pacman");
+                try args.append("-S");
+                try args.append("--noconfirm");
+            },
+            else => unreachable, // Should never happen
+        }
+
+        // Add the package name and version if specified
+        if (version) |ver| {
+            if (!std.mem.eql(u8, ver, "latest")) {
+                const pkg_with_version = try std.fmt.allocPrint(self.allocator, "{s}={s}", .{ name, ver });
+                defer self.allocator.free(pkg_with_version);
+                try args.append(pkg_with_version);
+            } else {
+                try args.append(name);
+            }
+        } else {
+            try args.append(name);
+        }
+
+        // Add additional options if any
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+
+        // Run with sudo if needed
+        if (manager.needsSudo()) {
+            args.insert(0, "sudo") catch return error.OutOfMemory;
+        }
+
+        var proc = std.process.Child.init(args.items, self.allocator);
+        proc.stderr_behavior = .Inherit;
+        proc.stdout_behavior = .Inherit;
+        const term = try proc.spawnAndWait();
+        if (term.Exited != 0) {
+            std.debug.print("Command failed with exit code {d}\n", .{term.Exited});
+            return error.CommandFailed;
+        }
+    }
+
+    fn installBrewPackage(self: *Self, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = options; // Not used in this implementation
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("brew");
+        try args.append("install");
+        try args.append(name);
+        if (version) |ver| {
+            if (!std.mem.eql(u8, ver, "latest")) {
+                try args.append("@");
+                try args.append(ver);
+            }
+        }
+        
+        try self.runCommand(args.items);
+    }
+
+    /// Runs a shell command and checks its exit status
+    fn runCommand(self: *Self, args: []const []const u8) !void {
+        // Create a copy of the command for display
+        const cmd_str = std.mem.join(self.allocator, " ", args) catch "[failed to format command]";
+        defer self.allocator.free(cmd_str);
+        
+        std.debug.print("Running: {s}\n", .{cmd_str});
+        
+        var proc = std.process.Child.init(args, self.allocator);
+        proc.stderr_behavior = .Inherit;
+        proc.stdout_behavior = .Inherit;
+        
+        const term = proc.spawnAndWait() catch |err| {
+            std.debug.print("Failed to execute command: {s}\nError: {s}\n", .{cmd_str, @errorName(err)});
+            return error.CommandFailed;
+        };
+        
+        if (term.Exited != 0) {
+            std.debug.print("Command failed with exit code {d}: {s}\n", .{term.Exited, cmd_str});
+            return error.CommandFailed;
+        }
+    }
+
+    fn runCustomInstallScript(self: *Self, name: []const u8, script_url: []const u8, options: ?[]const []const u8) !void {
+        _ = name; // Not used in this implementation
+
+        std.debug.print("Running custom installation from {s}\n", .{script_url});
+
+        // For now, assume script_url is a local script
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("/bin/sh");
+        try args.append("-c");
+
+        // Add script URL and any additional arguments
+        var script_cmd = std.ArrayList(u8).init(self.allocator);
+        defer script_cmd.deinit();
+
+        try script_cmd.writer().print("{s}", .{script_url});
+
+        if (options) |opts| {
+            for (opts) |opt| {
+                try script_cmd.writer().print(" {s}", .{opt});
+            }
+        }
+
+        try args.append(script_cmd.items);
+        try self.runCommand(args.items);
+    }
+
+    // Stub implementations for other package managers
+    fn installCargoPackage(self: *Self, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = version; // Not yet used
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("cargo");
+        try args.append("install");
+        try args.append(name);
+        
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+        
+        try self.runCommand(args.items);
+    }
+
+    fn installNpmPackage(self: *Self, manager: PackageManager, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = version; // Not yet used
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        const cmd = if (manager == .npm) "npm" else "yarn";
+        
+        // Check if we need to use sudo
+        const needs_sudo = true; // npm install -g typically needs sudo unless configured otherwise
+        
+        if (needs_sudo) {
+            try args.append("sudo");
+            std.debug.print("Note: Using sudo for npm install -g. You may be prompted for your password.\n", .{});
+        }
+        
+        try args.append(cmd);
+        try args.append("install");
+        try args.append("-g");
+        
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+        
+        try args.append(name);
+        
+        const cmd_str = std.mem.join(self.allocator, " ", args.items) catch "[failed to format command]";
+        std.debug.print("Running: {s}\n", .{cmd_str});
+        
+        const result = self.runCommand(args.items) catch |err| {
+            if (needs_sudo) {
+                std.debug.print("\nFailed to install {s} with sudo. This might be because:\n", .{name});
+                std.debug.print("1. You don't have sudo access\n", .{});
+                std.debug.print("2. Your user doesn't have permission to use sudo\n", .{});
+                std.debug.print("\nTo fix this, you can either:\n", .{});
+                std.debug.print("1. Run this command with sudo privileges\n", .{});
+                std.debug.print("2. Configure npm to use a local directory (recommended):\n", .{});
+                std.debug.print("   mkdir -p ~/.npm-global\n", .{});
+                std.debug.print("   npm config set prefix '~/.npm-global'\n", .{});
+                std.debug.print("   Add 'export PATH=~/.npm-global/bin:$PATH' to your shell config\n", .{});
+                std.debug.print("   Then try running this command again\n", .{});
+            }
+            return err;
+        };
+        return result;
+    }
+
+    fn installPipPackage(self: *Self, manager: PackageManager, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = version; // Not yet used
+        _ = manager; // Not used
+        
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        // Use 'python3 -m pip' for better reliability
+        try args.append("python3");
+        try args.append("-m");
+        try args.append("pip");
+        try args.append("install");
+        
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+        
+        try args.append(name);
+        
+        try self.runCommand(args.items);
+    }
+
+    fn installGoPackage(self: *Self, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = version; // Not yet used
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("go");
+        try args.append("install");
+        
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+        
+        try args.append(name);
+        
+        std.debug.print("Running: {s}\n", .{std.mem.join(self.allocator, " ", args.items) catch "[failed to format command]"});
+        try self.runCommand(args.items);
+    }
+
+    fn installGemPackage(self: *Self, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = version; // Not yet used
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append("gem");
+        try args.append("install");
+        
+        if (options) |opts| {
+            try args.appendSlice(opts);
+        }
+        
+        try args.append(name);
+        
+        std.debug.print("Running: {s}\n", .{std.mem.join(self.allocator, " ", args.items) catch "[failed to format command]"});
+        try self.runCommand(args.items);
+    }
+
+    fn installAppStorePackage(self: *Self, name: []const u8, version: ?[]const u8, options: ?[]const []const u8) !void {
+        _ = .{self, version, options}; // Not yet used
+        std.debug.print("Installing App Store package {s} (requires 'mas' CLI tool)\n", .{name});
+        // TODO: Implement App Store package installation
+    }
+};

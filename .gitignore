@@ -1,0 +1,40 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Luau intermediate files (if any)
+*.luauc
+
+# macOS specific
+.DS_Store
+*.xcuserdatad/
+
+# IDE-specific files
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# Node.js dependencies
+node_modules/
+npm-debug.log
+yarn-error.log
+yarn-debug.log
+
+# Documentation build output
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+
+# Log files
+*.log
